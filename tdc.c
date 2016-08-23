@@ -7,15 +7,17 @@
 #include <linux/device.h>
 #include <linux/poll.h>
 #include <linux/slab.h>
+#include <linux/kfifo.h>
+#include <linux/timer.h>
 #include <asm/uaccess.h>
 #include <asm/io.h>
 #include "tdc.h"
 
-MODULE_LICENSE("Dual BSD/GPL");
+MODULE_AUTHOR("kusoyao");
+MODULE_DESCRIPTION("E906 TDC Driver");
+MODULE_LICENSE("Dual MIT/GPL");
 
 static int tdc_devs = 1;        /* device count */
-static int tdc_major = 0;       /* MAJOR: dynamic allocation */
-static int tdc_minor = 0;       /* MINOR: static allocation */
 static struct cdev tdc_cdev;
 static struct class *tdc_class = NULL;
 static dev_t tdc_dev;
@@ -27,8 +29,28 @@ struct tdc_data {
 	unsigned char data[DPSRAM_LENGTH];
 };
 
-long tdc_ioctl(struct file *filp,unsigned int cmd, unsigned long arg)
-{
+static struct kfifo ev_fifo;
+static void *ev_fifo_buffer = 0;
+static unsigned long ev_buff_size = SZ_1M;
+module_param(ev_buff_size, ulong, 0444);
+
+#define TDC_READOUT_PERIOD 5*HZ
+static struct timer_list tdc_timer;
+static void tdc_readout(unsigned long arg){
+	unsigned long left = 0;
+	left = kfifo_avail(&ev_fifo);
+	printk(KERN_ALERT "buffer left %lu\n", left);
+	if( left < DPSRAM_LENGTH){
+		printk(KERN_ALERT "event buffer full.\n");
+		goto out;
+	}
+	kfifo_in(&ev_fifo, reg, DPSRAM_LENGTH);
+out:
+	/* set next readout */
+	mod_timer(&tdc_timer, jiffies + TDC_READOUT_PERIOD);
+}
+
+static long tdc_ioctl(struct file *filp,unsigned int cmd, unsigned long arg){
 	struct tdc_data *tdc = filp->private_data;
 	int retval = 0;
 	struct ioctl_cmd data;
@@ -51,13 +73,13 @@ long tdc_ioctl(struct file *filp,unsigned int cmd, unsigned long arg)
 				goto done;
 			}
 			write_lock(&tdc->lock);
-			//iowrite32( data.val, reg+data.offset);
+			/* iowrite32( data.val, reg+data.offset); */
 			*(reg+data.offset) = data.val;
 			write_unlock(&tdc->lock);
 			break;
 
 		case IOCTL_GETREG:
-			//if allow write, it also allow read!
+			/* if allow write, it also allow read! */
 			if(!access_ok(VERIFY_WRITE, (void __user *)arg, _IOC_SIZE(cmd))) {
 				retval = -EFAULT;
 				goto done;
@@ -72,7 +94,7 @@ long tdc_ioctl(struct file *filp,unsigned int cmd, unsigned long arg)
 				goto done;
 			}
 			read_lock(&tdc->lock);
-			//data.val = ioread32(reg+data.offset);
+			/* data.val = ioread32(reg+data.offset); */
 			data.val = *(reg+data.offset);
 			read_unlock(&tdc->lock);
 			
@@ -84,14 +106,14 @@ long tdc_ioctl(struct file *filp,unsigned int cmd, unsigned long arg)
 
 		case IOCTL_LED_ON:
 			write_lock(&tdc->lock);
-			//iowrite32( 0xF0E9060F, reg+LED_ADDR_OFFSET);
+			/* iowrite32( 0xF0E9060F, reg+LED_ADDR_OFFSET); */
 			*(reg+LED_ADDR_OFFSET) = 0xF09060F;
 			write_unlock(&tdc->lock);
 			break;
 
 		case IOCTL_LED_OFF:
 			write_lock(&tdc->lock);
-			//iowrite32( 0x10E90601, reg+LED_ADDR_OFFSET);
+			/* iowrite32( 0x10E90601, reg+LED_ADDR_OFFSET); */
 			*(reg+LED_ADDR_OFFSET) = 0x10E90601;
 			write_unlock(&tdc->lock);
 			break;
@@ -105,13 +127,11 @@ done:
 	return retval;
 }
 
-ssize_t tdc_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos)
-{
+static ssize_t tdc_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos){
 	struct tdc_data *tdc = filp->private_data;
 	int retval;
 	int left_byte;
 	int rep;
-	int i;
 	
 	if( count > DPSRAM_LENGTH ) count = DPSRAM_LENGTH;
 	left_byte = count & 0x3;
@@ -127,9 +147,9 @@ ssize_t tdc_read(struct file *filp, char __user *buf, size_t count, loff_t *f_po
 	
 	read_lock(&tdc->lock);
 	ioread32_rep(reg, tdc->data, rep);
-	//for(i=0;i<rep;++i){
-	//	((unsigned long*)tdc->data)[i] = *(reg+i);
-	//}
+	/*for(i=0;i<rep;++i){
+		((unsigned long*)tdc->data)[i] = *(reg+i);
+	}*/
 	read_unlock(&tdc->lock);
 	
 	if( copy_to_user(buf, tdc->data, count) ) {
@@ -142,8 +162,7 @@ out:
 	return retval;
 }
 
-int tdc_close(struct inode *inode, struct file *filp)
-{
+static int tdc_close(struct inode *inode, struct file *filp){
 	struct tdc_data *tdc = filp->private_data;
 
 	if (tdc) {
@@ -153,8 +172,7 @@ int tdc_close(struct inode *inode, struct file *filp)
 	return 0;
 }
 
-int tdc_open(struct inode *inode, struct file *filp)
-{
+static int tdc_open(struct inode *inode, struct file *filp){
 	struct tdc_data *tdc;
 
 	tdc = kmalloc(sizeof(struct tdc_data), GFP_KERNEL);
@@ -170,7 +188,7 @@ int tdc_open(struct inode *inode, struct file *filp)
 	return 0;
 }
 
-struct file_operations tdc_fops = {
+static struct file_operations tdc_fops = {
 	.owner = THIS_MODULE,
 	.open = tdc_open,
 	.release = tdc_close,
@@ -178,20 +196,26 @@ struct file_operations tdc_fops = {
 	.unlocked_ioctl = tdc_ioctl,
 };
 
-static int tdc_init(void)
-{		
+static unsigned long rounded_down(unsigned long size){
+	unsigned long order = SZ_2G;
+	while(!(size & order)){
+		order>>=1;
+	}
+	return order;
+}
+
+static int tdc_init(void){		
 	/* init */
-	dev_t tdc_dev = MKDEV(tdc_major, 0);
 	int alloc_ret = 0;
 	int cdev_err = 0;
 	struct device *class_dev = NULL;
-
+	int fifo_ret = 0;
+	int tdc_major = 0;
 	/* get major number, store to tdc_dev*/
 	alloc_ret = alloc_chrdev_region(&tdc_dev, 0, tdc_devs, "tdc");
 	if (alloc_ret)
 		goto error;
 	tdc_major = MAJOR(tdc_dev);
-
 	/* register handler */
 	cdev_init(&tdc_cdev, &tdc_fops);
 	tdc_cdev.owner = THIS_MODULE;
@@ -206,7 +230,7 @@ static int tdc_init(void)
 	if (IS_ERR(tdc_class)) {
 		goto error;
 	}
-	class_dev = device_create( tdc_class, NULL, tdc_dev, NULL, "tdc%d", tdc_minor);
+	class_dev = device_create( tdc_class, NULL, tdc_dev, NULL, "tdc");
 	/* cat /proc/iomem */
 	res = request_mem_region(DPSRAM_ADDR, DPSRAM_LENGTH, "TDC_DPSRAM");
 	if(!res){
@@ -220,10 +244,37 @@ static int tdc_init(void)
 		goto error;
 	}
 	
-	printk(KERN_ALERT "tdc driver loaded successful. MAJOR number is %d\n", tdc_major);
-	return 0;
+	/* event buffer fifo */
+	ev_buff_size = rounded_down(ev_buff_size);
+	ev_fifo_buffer = kmalloc( ev_buff_size, GFP_KERNEL);
+	fifo_ret = kfifo_init(&ev_fifo, ev_fifo_buffer, ev_buff_size);
+	if(fifo_ret){
+		printk(KERN_ALERT "tdc event fifo create fail.");
+		goto error;
+	}
+	printk(KERN_ALERT "allocate tdc event fifo %lu bytes. addr=%p\n", ev_buff_size, ev_fifo_buffer);
+	
+	/* init timer */
+	init_timer(&tdc_timer);
+	tdc_timer.function = tdc_readout;
+	tdc_timer.data = (unsigned long)reg;
+	tdc_timer.expires = jiffies + TDC_READOUT_PERIOD;
+	add_timer(&tdc_timer);
+	
+	/* for DEBUG
+	printk(KERN_ALERT "MAJOR number %d\n", tdc_major);
+	printk(KERN_ALERT "ev_fifo_buffer %p\n", ev_fifo_buffer);
+	printk(KERN_ALERT "request_mem_region res %p\n", res);
+	printk(KERN_ALERT "ioremap_nocache %p\n", reg);
+	printk(KERN_ALERT "cdev_err %d\n", cdev_err);
+	printk(KERN_ALERT "alloc_ret %d\n", alloc_ret);
+	*/
+	printk(KERN_ALERT "tdc driver loaded successful.\n");
 
+	return 0;
+	
 error:
+	if (ev_fifo_buffer) kfree(ev_fifo_buffer);
 	if (res) release_mem_region(DPSRAM_ADDR, DPSRAM_LENGTH);
 	if (reg) iounmap(reg);
 	if (cdev_err == 0) cdev_del(&tdc_cdev);
@@ -233,8 +284,13 @@ error:
 	return -1;
 }
 
-static void tdc_exit(void)
-{
+static void tdc_exit(void){
+	/* delete timer */
+	del_timer_sync(&tdc_timer);
+	
+	/* release fifo buffer*/
+	kfree(ev_fifo_buffer);
+	
 	iounmap((void *)reg);
 	release_mem_region(DPSRAM_ADDR, DPSRAM_LENGTH);
 	
@@ -253,5 +309,3 @@ static void tdc_exit(void)
 
 module_init(tdc_init);
 module_exit(tdc_exit);
-
-
