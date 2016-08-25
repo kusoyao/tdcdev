@@ -10,6 +10,8 @@
 #include <linux/slab.h>
 #include <linux/kfifo.h>
 #include <linux/timer.h>
+#include <linux/sched.h>
+#include <linux/wait.h>
 #include <asm/uaccess.h>
 #include <asm/io.h>
 #include "tdc.h"
@@ -35,6 +37,7 @@ struct tdc_device {
 	spinlock_t lock;
 	struct timer_list tdc_timer;	/* */
 	atomic_t buffer_been_full;	/* buffer full counter*/
+	wait_queue_head_t wait;
 };
 
 static struct tdc_device *dev = NULL;
@@ -46,7 +49,6 @@ module_param(ev_buff_size, ulong, 0444);
 static void tdc_readout(unsigned long arg){
 	unsigned long left = 0;
 	left = kfifo_avail(&dev->ev_fifo);
-	printk(KERN_ALERT "buffer left %lu\n", left);
 	if( left < sizeof(struct tdc_event)){
 		atomic_inc(&dev->buffer_been_full);
 		printk(KERN_ALERT "event buffer full. %d\n", atomic_read(&dev->buffer_been_full));
@@ -54,6 +56,7 @@ static void tdc_readout(unsigned long arg){
 	}
 	kfifo_in(&dev->ev_fifo, reg, sizeof(struct tdc_event));
 out:
+	wake_up(&dev->wait);
 	/* set next readout */
 	mod_timer(&dev->tdc_timer, jiffies + TDC_READOUT_PERIOD);
 }
@@ -144,6 +147,12 @@ static ssize_t tdc_read(struct file *filp, char __user *buf, size_t count, loff_
 		return 0;
 	}
 	
+	retval = wait_event_interruptible(dev->wait, kfifo_len(&dev->ev_fifo) );
+	if(retval != 0) {
+		/* wake up by signal! */
+		return 0;
+	}
+
 	read_lock(&tdc->lock);
 	retval = kfifo_to_user(&dev->ev_fifo, buf, count, &copied);
 	read_unlock(&tdc->lock);
@@ -217,6 +226,7 @@ static int tdc_init(void){
 	dev = kmalloc( sizeof(struct tdc_device), GFP_KERNEL);
 	spin_lock_init(&dev->lock);
 	atomic_set(&dev->buffer_been_full, 0);
+	init_waitqueue_head(&dev->wait);
 	
 	/* get major number, store to tdc_dev*/
 	alloc_ret = alloc_chrdev_region(&dev->tdc_dev, 0, TDC_DEVICES, "tdc");
@@ -304,9 +314,6 @@ static void tdc_exit(void){
 	/* release fifo buffer*/
 	kfree(dev->ev_fifo_buffer);
 	
-	/* release device struct*/
-	kfree(dev);
-	
 	iounmap((void *)reg);
 	release_mem_region(DPSRAM_ADDR, DPSRAM_LENGTH);
 	
@@ -318,6 +325,9 @@ static void tdc_exit(void){
 	cdev_del(&dev->tdc_cdev);
 	/* release major number*/
 	unregister_chrdev_region( dev->tdc_dev, TDC_DEVICES);
+
+	/* release device struct*/
+	kfree(dev);
 
 	printk(KERN_ALERT "tdc driver removed successful.\n");
 
